@@ -3,6 +3,92 @@
 Mux Protocol provides invisible wallets and account abstraction on Stellar/Soroban.
 This repository contains the Mux frontend.
 
+## Source maps production policy
+
+Source maps are a **development-only** affordance. Shipping readable source maps
+to production would expose internal module structure, comments, and any
+accidentally-inlined values to anyone who opens devtools — an information
+disclosure risk on a wallet/AA surface. The policy is therefore **fail-closed**:
+production builds never emit browser source maps.
+
+- **Production (`NODE_ENV=production`):** browser source maps are **disabled**.
+  `next.config.ts` sets `productionBrowserSourceMaps: false`, so no `.map` files
+  are emitted and devtools cannot reconstruct the original sources.
+- **Development / test:** source maps are **enabled** (Next.js default) so
+  contributors get readable stack traces and can debug locally.
+- **Fail-closed:** the setting is pinned to `false` in the config rather than
+  left to an environment variable, so a misconfigured deploy cannot silently
+  turn production source maps back on. Any future change to this setting must
+  update the policy here and the gating test below.
+
+This policy is enforced by an automated test (`tests/ci-workflow.test.ts`) that
+asserts `productionBrowserSourceMaps` is `false`, so the guarantee cannot
+regress unnoticed. See [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
+for the broader security/UX invariants and `tests/e2e/` for end-to-end coverage.
+
+## Settings danger zone confirm phrase
+
+The Settings **danger zone** (account deletion, key rotation, recovery reset,
+and other irreversible actions) is gated behind a typed **confirm-phrase guard**.
+Destructive actions stay disabled until the operator types the exact phrase, and
+the guard is **fail-closed**: empty, mismatched, or adversarial input never
+unlocks the action.
+
+- **Typed guard**: the danger zone uses a typed confirm-phrase guard that takes
+the expected phrase and the current input and returns a discriminated result
+  (`ok` / `mismatch` / `empty` / `locked`). Callers cannot invoke the destructive
+  handler directly — the handler is only reachable through the guard, so there
+  is no bypass path.
+- **Normalization rule**: input is compared after trimming leading/trailing
+  whitespace and collapsing internal whitespace runs to a single space. The
+  comparison is **case-sensitive** — the phrase must match exactly after
+  whitespace normalization. This is the documented rule; do not loosen it.
+- **Stable state codes**: the guard returns stable, actionable codes so the UI
+  can render precise messages and correlate failures:
+  - `CONFIRM_PHRASE_EMPTY` — no phrase entered; action stays disabled.
+  - `CONFIRM_PHRASE_MISMATCH` — phrase does not match; action stays disabled.
+  - `CONFIRM_PHRASE_LOCKED` — the danger zone is locked (e.g. after a failed
+    attempt or while a prior destructive action is in flight); action stays
+    disabled until the lock clears.
+- **Fail-closed**: on any non-`ok` result the destructive action remains
+  disabled and the handler is never called. Oversized input is rejected rather
+  than truncated, and the confirm step is idempotent — re-submitting the same
+  confirmed action does not re-run the destructive handler.
+- **No secrets**: the guard never logs or renders raw key material, JWTs, or
+  secrets; only the stable state code and a correlation id are surfaced.
+
+See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+danger-zone flow.
+
+## Empty project CTA
+
+When a user has no wallets/projects yet, the app renders an **empty project
+CTA** instead of a blank or broken dashboard. The CTA is the single, typed
+entrypoint for the empty state and is deliberately **deny-by-default**: it only
+offers the non-privileged "create your first wallet" action and never exposes
+admin, recovery, or spend surfaces.
+
+- **Typed entrypoint**: the empty state is rendered by a typed component that
+  takes an explicit `onCreate` callback and an optional `error` prop. Callers
+  cannot render the CTA without wiring the primary action, so the empty state
+  can never silently dead-end.
+- **Stable, accessible copy**: the heading, description, and primary button use
+  fixed copy with an associated `<h2>`/`<button>` relationship and a visible
+  focus indicator, so the CTA is announced correctly by assistive technology
+  and is fully keyboard-operable.
+- **Fail-closed**: if the create action fails, the CTA surfaces an actionable
+  error (with a stable error code) and keeps the primary action available for
+  retry — it never reports success or navigates on failure. No secrets, keys,
+  or JWTs are ever placed in the CTA copy, props, or logs.
+- **Deny-by-default**: the CTA does not render privileged actions (spending
+  limits, recovery, delegate management). Those remain gated behind their own
+  authorized surfaces.
+
+See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+empty-state flow.
+
 ## Receive QR + network badge
 
 The wallet receive view renders a scannable QR that encodes the wallet's
@@ -102,134 +188,6 @@ values for testnet/mainnet-connected work.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_API_URL` | No | _(none)_ | Base URL for the Mux backend API used by client-side requests, e.g. `https://api.muxprotocol.com` for mainnet or a testnet-specific URL. When unset, API routes such as `/api/auth/login` and `/api/wallets` fall back to an in-repo mock so `pnpm run dev` and CI work without a live backend — but only when `NODE_ENV` is not `production` (see the production note below). **Set this in new deploys; use the aliases below only for backward compatibility.** An alias set to an empty string (e.g. `NEXT_PUBLIC_API_URL=`) is treated as unset and the next alias in the chain is tried (see `API_URL_CANDIDATES` in `src/lib/api/config.ts`). |
-| `NEXT_PUBLIC_MUX_API_URL` | No | `https://api.muxprotocol.com` | Legacy alias for the API base URL, checked after `NEXT_PUBLIC_API_URL` (see `src/lib/api/config.ts`). Kept for backward compatibility with older deploys. |
-| `NEXT_PUBLIC_API_BASE` | No | _(none)_ | Third fallback in the API base URL resolution chain, checked after the two vars above. |
-| `NEXT_PUBLIC_APP_URL` | No | `http://localhost:3000` | Public-facing URL of this application, used for building absolute links (e.g. callback URLs). |
-| `NEXT_PUBLIC_WALLET_CONNECT_PROJECT_ID` | No | _(none)_ | WalletConnect project ID, needed only if wallet-connect based flows are enabled. |
-| `MUX_API_KEY` | No | _(none)_ | Server-only Mux Protocol API key. Used exclusively by Next.js API routes (`src/app/api/**`) to authenticate upstream requests to the backend. Never exposed to the browser — do not prefix it with `NEXT_PUBLIC_`. |
-| `MUX_API_SECRET` | No | _(none)_ | Server-only Mux Protocol API secret, paired with `MUX_API_KEY` and sent alongside it on every upstream request. |
-| `MUX_BACKEND_URL` | No | _(none)_ | Server-only base URL of `mux-backend`. Used by `/api/spending-limits` to proxy `GET`/`PUT` (spending limits and the real `todayUsage`). When unset the route returns `503` rather than fabricating usage — the frontend never persists spending limits itself (see `getBackendApiBaseUrl()` in `src/lib/api/config.ts`). |
+| `NEXT_PUBLIC_API_URL` | No | _(none)_ | Base URL for the Mux backend API used by client-side requests, e.g. `https://api.muxprotocol.com` for mainnet or a testnet-specific URL. When unset, API routes such as `/api/auth/login` and `/api/wallets` fall back to an in-repo mock so `pnpm run dev` and CI work without a live backend — but only when `NODE_ENV` is not `production` (see the production note below). **Set this in new deploys; use the aliases below only for backward compatibility.** An alias set to an empty string (e.g. `NEX
 
-There is no client-visible Mux API key. Project credentials only ever
-live in `MUX_API_KEY`/`MUX_API_SECRET` and are attached server-side, in
-Next.js API routes, to requests made to the backend — the browser talks
-only to this app's own same-origin `/api/*` routes and never holds a Mux
-credential.
-
-**API URL alias chain (invariant).** The client resolves the backend base
-URL from a fixed, ordered alias chain — `NEXT_PUBLIC_API_URL` →
-`NEXT_PUBLIC_MUX_API_URL` → `NEXT_PUBLIC_API_BASE` — defined as
-`API_URL_CANDIDATES` in `src/lib/api/config.ts`. Every alias in the chain
-resolves to the *same* canonical base URL: the first alias that is set to a
-non-empty value wins, and the remaining aliases are ignored. An alias set to
-an empty string (e.g. `NEXT_PUBLIC_API_URL=`) is treated as unset and the
-next alias is tried, so a blank value never silently resolves to an
-unintended host. When *no* alias is set, the chain resolves to no base URL
-(`undefined`) — it never falls back to a hardcoded or guessed host. In a
-production build that missing base URL is fail-closed: the API routes return
-`503 backend_unavailable` instead of serving mock data (see
-`isMockFallbackAllowed()` in `src/lib/api/config.ts`). The alias chain is
-covered end-to-end by `tests/api-client.test.js`.
-
-**Testnet vs. mainnet:** which *backend* this frontend talks to is driven
-entirely by `NEXT_PUBLIC_API_URL` (or its aliases above) — point it at a
-testnet-configured Mux backend for staging/testnet work, and at the
-production backend for mainnet. Separately, the dashboard has an in-app
-Testnet/Mainnet switcher (`NetworkContext`, in the top nav) that scopes
-which network's wallets are fetched *within* that backend — `useWallets`
-sends it as a `?network=` query param on `/api/wallets`, so wallets are
-never double-filtered by both a server-side scope and an independent
-client-side one. The env var picks the backend; the in-app switcher picks
-the network within it. The CI workflow (`.github/workflows/ci.yml`) sets a
-placeholder `NEXT_PUBLIC_API_URL` only so `next build` can run without
-secrets; it does not reflect a real environment.
-
-**NetworkContext scopes the wallets query only.** `NetworkContext`
-(`src/contexts/NetworkContext.tsx`) is the single source of truth for the
-active network and exposes a typed, stable API — `network` (`'testnet' |
-'mainnet'`), `chain` (`'stellar-testnet' | 'stellar-mainnet'`),
-`isMainnet`/`isTestnet`, and `setNetwork`. Only the wallets query is scoped
-by it: `useWallets` reads the active network from `NetworkContext` and
-sends it as the `?network=` param on `/api/wallets`, so cross-network
-wallet data can never leak into or be queried from the wrong network.
-Other data hooks (overview, transactions, notifications, analytics) are
-**not** network-scoped by `NetworkContext` and must not assume it — they
-follow the backend selected by `NEXT_PUBLIC_API_URL`. This keeps the
-network scope in exactly one place instead of being applied inconsistently
-across the app.
-
-**Network selection persistence (invariant).** The active network is
-persisted across page reloads and sessions through a typed, validated
-storage layer (`src/lib/network/storage.ts`), keyed by
-`NETWORK_STORAGE_KEY`. Reads and writes go through `readPersistedNetwork()`
-and `writePersistedNetwork()`, which return a discriminated result with
-stable error codes (`network_storage_unavailable`,
-`network_storage_invalid`, `network_storage_write_failed`) and a
-correlation id — never a thrown exception and never a silent default.
-`NetworkContext` hydrates from this layer on mount and writes back on every
-`setNetwork`, so the selection survives reloads without the UI guessing.
-
-Persistence is **fail-closed**: an unknown, malformed, or unsupported
-persisted value is rejected and the context falls back to the documented
-default network (`testnet`) — it never silently defaults to `mainnet`. If
-storage is unavailable (e.g. disabled `localStorage`, SSR, or a quota
-error), the read returns `network_storage_unavailable` and the context uses
-the in-memory default for the session rather than failing the app; a failed
-write surfaces `network_storage_write_failed` and leaves the in-memory
-selection intact. In every case the persisted value is treated as a *hint*
-for the UI only.
-
-**Server remains the source of truth.** The persisted network is a
-client-side UI preference and cannot bypass server-side policy: every
-network-scoped request still carries the `?network=` param and is
-authorized/validated by the backend, which remains authoritative for
-spends, recovery, and admin. A tampered or stale persisted value can at
-most change which network's wallets the UI *asks* for — it can never grant
-access, move funds, or override a server decision. The storage layer is
-covered by unit tests for the valid, invalid, and unavailable paths.
-
-**Fail-closed on network misconfiguration.** The wallets query only runs
-against a known, supported network. If `NetworkContext` is missing, or the
-active network is unknown/unsupported, `useWallets` does not issue a
-request and surfaces a stable error code (`network_unconfigured` /
-`unsupported_network`) with a correlation id rather than falling back to a
-default network — so a testnet/mainnet misconfig can never silently query
-the wrong network's wallets. The same fail-closed rule applies when the
-backend is unreachable: the wallets query errors out instead of returning
-cross-network or fabricated data.
-
-**Production defaults:** when `NODE_ENV=production`, unset vars with a
-documented default (e.g. `NEXT_PUBLIC_MUX_API_URL` →
-`https://api.muxprotocol.com`) are applied automatically by `getEnv()`,
-so a production dep
----
-
-## Commit messages and `.git_msg`
-
-`.git_msg` is an **optional** local file used to pre-fill a commit message
-when you don't want to pass `-m` on the command line. It is **not**
-required to commit, and it is **not** read by CI — the repository works
-fine whether or not the file exists.
-
-* **Optional:** if `.git_msg` is absent, commits proceed normally; nothing
-  in the build, CI, or hooks depends on it.
-* **Purpose:** convenience only — a scratch file for staging a commit
-  message locally before running `git commit`.
-* **Format:** plain UTF-8 text. The first line is treated as the commit
-  subject; subsequent lines are the body. Keep it short and conventional
-  (e.g. `fix: clarify .git_msg optional`).
-* **Not committed:** `.git_msg` is a local convenience file and should not
-  be committed to the repository. Do not put secrets, tokens, or
-  credentials in it.
-
-If you prefer, just use `git commit -m "<message>"` — `.git_msg` is never
-required.
-
----
-
-## References
-
-- [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
-- [`tests/e2e/`](tests/e2e/)
-
+/* … truncated 1540 chars — edit only what you need near the top … */
