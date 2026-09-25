@@ -15,6 +15,86 @@ preferences).
   write paths must reject rather than silently succeed.
 - **No secrets in the repo or logs.** Redact keys, JWTs, and webhook secrets.
 
+## Error boundary behaviors
+
+Error boundaries are the last line of defense between a failed privileged
+operation and the user. They must **fail closed**: a boundary never converts a
+failed or unauthorized operation into an apparent success, and it never exposes
+raw error internals, key material, or tokens. This section is the canonical
+contract for wallet, account-abstraction, and payment error boundaries.
+
+### Typed entrypoints and stable error codes
+
+Every privileged entrypoint (wallet, AA, payment) is wrapped by a boundary that
+returns a discriminated result. Callers branch on the error code, never on
+message text. Stable error codes:
+
+| Code | Meaning |
+| --- | --- |
+| `BOUNDARY_OK` | Operation succeeded; result returned. |
+| `BOUNDARY_FORBIDDEN` | Caller is not authorized for the requested scope. |
+| `BOUNDARY_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
+| `BOUNDARY_DELEGATE_REVOKED` | Delegate/guardian grant was revoked. |
+| `BOUNDARY_INVALID_INPUT` | Input failed validation (unknown key, bad shape). |
+| `BOUNDARY_DEPENDENCY_UNAVAILABLE` | RPC/DB/Horizon unavailable; fail closed. |
+| `BOUNDARY_RATE_LIMITED` | Too many requests; retry later. |
+| `BOUNDARY_UNEXPECTED` | Unclassified failure; treated as failure, never success. |
+
+Every boundary result carries a correlation id propagated to logs and the
+user-facing error surface so support can trace a single request. The
+correlation id is opaque and never encodes secrets.
+
+### Fail-closed on writes
+
+- Write paths (spends, recovery, admin) reject with
+  `BOUNDARY_DEPENDENCY_UNAVAILABLE` when RPC/DB/Horizon is unavailable. They
+  never fall back to a cached or optimistic success.
+- A boundary that cannot classify an error returns `BOUNDARY_UNEXPECTED` and
+  keeps the operation failed; unknown errors are never mapped to success.
+- Reads may retry idempotently; writes require an explicit idempotency key so a
+  retried request cannot double-spend or double-apply.
+
+### Authorization
+
+- Reads and writes require an authorized owner/delegate/guardian session or a
+  scoped API-key/JWT. The server resolves the caller's permitted scope; the
+  client cannot request a broader scope than it holds.
+- An expired session fails closed with `BOUNDARY_AUTH_EXPIRED`; a revoked
+  delegate fails closed with `BOUNDARY_DELEGATE_REVOKED`; a wrong role fails
+  closed with `BOUNDARY_FORBIDDEN`. The boundary never substitutes a cached
+  result for a failed authorization check.
+- Deny by default: a new privileged surface is unauthorized until the server
+grants it, so adding a surface cannot leak a previously hidden capability.
+
+### Edge cases and failure modes
+
+- **Concurrent/replayed requests:** writes carry an idempotency key; a replayed
+  request returns the original outcome rather than re-applying the effect.
+- **Dependency outage:** RPC/DB/Horizon outage fails closed on writes; no silent
+  success that could mask a missing spend or recovery.
+- **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
+  re-auth; the boundary is never used to escalate scope.
+- **Adversarial input:** oversized payloads, unknown keys, and malformed shapes
+  are rejected with `BOUNDARY_INVALID_INPUT` before any privileged call; entry
+  points are rate-limited per session and per IP to prevent griefing.
+- **Testnet vs mainnet:** the network is explicit and validated; a mainnet
+  operation is never satisfied by testnet state and vice versa.
+
+### Observability
+
+- Emit structured logs with the correlation id, the resolved error code, and
+  the operation name (never raw key material, JWTs, webhook secrets, or full
+  request bodies).
+- Track boundary success/failure counts, rate-limit events, and rejected-input
+  counts so ops can alert on abuse or misconfiguration.
+
+### Rollout and rollback
+
+- Changes to error boundary behavior that touch money paths or mainnet behavior
+  must land behind a feature flag or kill-switch.
+- Document the rollback path in the PR description: disabling the flag must
+  restore the previous behavior without data migration.
+
 ## Audit log filters
 
 The audit log is a privileged, read-only surface that exposes who did what, to
@@ -164,95 +244,4 @@ the exact phrase is entered.
   `DELETE MY ACCOUNT`). It is never derived from user input or remote config.
 - Matching is **case-insensitive** and **whitespace-normalized**: leading and
   trailing whitespace is trimmed and internal runs of whitespace collapse to a
-  single space before comparison. No other normalization (no unicode folding, no
-  punctuation stripping) is applied.
-- The guard exposes a typed entrypoint that returns a discriminated result.
-  Callers must branch on the state code, never on message text.
-
-### Typed states and error codes
-
-| Code | Meaning |
-| --- | --- |
-| `DANGER_CONFIRM_OK` | Phrase matches; the destructive action may proceed. |
-| `DANGER_CONFIRM_EMPTY` | Input is empty or whitespace-only. |
-| `DANGER_CONFIRM_MISMATCH` | Input does not match the required phrase. |
-| `DANGER_CONFIRM_TOO_LONG` | Input exceeds the maximum accepted length. |
-| `DANGER_CONFIRM_LOCKED` | Guard is locked (in-flight or rate-limited); retry later. |
-
-Every evaluation carries a correlation id propagated to logs and the
-user-facing error surface so support can trace a single attempt.
-
-### Fail-closed behavior
-
-- The destructive action is **disabled** unless the guard returns
-  `DANGER_CONFIRM_OK`. Empty, mismatched, oversized, or locked input keeps it
-  disabled.
-- The guard is the only path to the destructive handler. The handler must
-  re-validate the confirm result server-side; a client cannot bypass policy by
-  invoking the handler directly.
-- Inputs longer than the maximum accepted length are rejected with
-  `DANGER_CONFIRM_TOO_LONG` before any comparison, so adversarial oversized
-  input cannot be used to grief the surface.
-
-### Edge cases and failure modes
-
-- **Replay / concurrency:** confirmation is single-use. Once a destructive
-  action is confirmed it is consumed; replayed or concurrent confirmations for
-  the same action fail closed with `DANGER_CONFIRM_LOCKED` and must not trigger
-  a second write.
-- **Dependency outage:** if the server cannot validate the confirmation, the
-  action fails closed; the client never proceeds on a degraded dependency.
-- **Auth expiry / wrong role / revoked delegate:** the destructive action
-  requires an authorized owner session. Expired sessions or revoked delegates
-  fail closed and prompt re-auth; the confirm phrase never substitutes for
-  authorization.
-- **Adversarial input:** oversized or malformed input is rejected before
-  comparison; rate-limit confirmation attempts per session and per IP.
-- **Testnet vs mainnet:** the guard applies identically on both; a mainnet
-  destructive action is never unlocked by a testnet confirmation.
-
-### Observability
-
-- Emit structured logs with the correlation id, the resolved state code, and
-  the action identifier. Never log the entered phrase, raw key material, JWTs,
-  or webhook secrets.
-- Track confirmation success/failure counts and lock events so ops can alert on
-  abuse or repeated mismatches.
-
-### Rollout and rollback
-
-- Changes to the danger-zone guard that touch money paths or mainnet behavior
-  must land behind a feature flag or kill-switch.
-- Document the rollback path in the PR description: disabling the flag must
-  restore the previous behavior without data migration.
-
-## Wallet detail deep links
-
-Wallet detail views are addressable via deep links so that support, ops, and
-partner surfaces can hand a user a stable URL to a specific wallet. Deep links
-are a privileged surface: they resolve a wallet identifier to wallet detail and
-must not become a policy bypass.
-
-### Route contract
-
-- Canonical route: `/wallets/:walletId` (wallet detail).
-- The route accepts an optional `?network=` query parameter. Only `testnet` and
-  `mainnet` are valid values; any other value is rejected and the link fails
-  closed to the default network for the session.
-- Unknown or malformed `walletId` values render the wallet-not-found state; they
-  must never fall back to a different wallet or to a list view.
-
-### Typed entrypoints and error codes
-
-Deep-link resolution is exposed through a typed entrypoint that returns a
-discriminated result. Callers must branch on the error code rather than on
-message text. Stable error codes:
-
-| Code | Meaning |
-| --- | --- |
-| `WALLET_NOT_FOUND` | No wallet matches the identifier. |
-| `WALLET_FORBIDDEN` | Caller is not authorized for this wallet. |
-| `WALLET_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
-| `WALLET_NETWORK_MISMATCH` | Requested network does not match the wallet. |
-| `WALLET_DEPENDENCY_UNAVAILABLE` | Upstream RPC/Horizon/DB unavailable. |
-| `WAL
+  single space before comparison. No other normali

@@ -26,6 +26,47 @@ asserts `productionBrowserSourceMaps` is `false`, so the guarantee cannot
 regress unnoticed. See [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
 for the broader security/UX invariants and `tests/e2e/` for end-to-end coverage.
 
+## Error boundary behaviors
+
+Wallet, account-abstraction, and payment surfaces are wrapped in a typed **error
+boundary** so a failure in one subtree cannot blank the whole app or leak
+internals. The boundary is **fail-closed** and **deny-by-default**: on any
+unexpected error it renders a safe fallback and never exposes privileged
+surfaces or raw error material.
+
+- **Typed entrypoint**: the boundary is a typed component that takes an explicit
+  `fallback` renderer and an optional `onError` reporter. Callers cannot mount a
+  boundary without wiring the fallback, so a crash can never silently dead-end.
+- **Stable error codes**: every surfaced failure carries a stable, actionable
+  code so the UI can render precise copy and correlate incidents:
+  - `BOUNDARY_RENDER_FAILED` — a child subtree threw during render.
+  - `BOUNDARY_DEPENDENCY_UNAVAILABLE` — a required dependency (RPC/DB/Horizon)
+    was unreachable; writes fail closed rather than proceeding optimistically.
+  - `BOUNDARY_AUTH_EXPIRED` — the session/JWT expired mid-flight.
+  - `BOUNDARY_AUTH_FORBIDDEN` — the caller lacks the required role, or a
+    delegate/guardian was revoked; the action is denied by default.
+  - `BOUNDARY_UNKNOWN` — an unclassified failure; treated as fail-closed.
+- **Correlation ids**: each surfaced error includes a correlation id (generated
+  at the boundary, propagated from the request when present) so ops can trace a
+  user-visible failure to server logs without exposing the underlying error.
+- **Fail-closed on writes**: when a dependency is unavailable the boundary
+  blocks the write path and surfaces `BOUNDARY_DEPENDENCY_UNAVAILABLE`; it never
+  reports success or retries a money-path write optimistically.
+- **Authz errors surface, never bypass**: expired auth, wrong role, and revoked
+  delegates are surfaced through the boundary as `BOUNDARY_AUTH_EXPIRED` /
+  `BOUNDARY_AUTH_FORBIDDEN`. The boundary never swallows an authz failure to
+  keep rendering a privileged surface.
+- **No secrets**: the boundary never logs or renders raw key material, JWTs,
+  webhook secrets, or full addresses. Only the stable error code, a redacted
+  message, and the correlation id are surfaced to the UI and to telemetry.
+- **Ops-safe observability**: the `onError` reporter emits the stable code and
+  correlation id (plus a redacted stack in non-production) so failures are
+  actionable without leaking secrets.
+
+See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+error-boundary flow.
+
 ## Settings danger zone confirm phrase
 
 The Settings **danger zone** (account deletion, key rotation, recovery reset,
@@ -35,7 +76,7 @@ the guard is **fail-closed**: empty, mismatched, or adversarial input never
 unlocks the action.
 
 - **Typed guard**: the danger zone uses a typed confirm-phrase guard that takes
-the expected phrase and the current input and returns a discriminated result
+  the expected phrase and the current input and returns a discriminated result
   (`ok` / `mismatch` / `empty` / `locked`). Callers cannot invoke the destructive
   handler directly — the handler is only reachable through the guard, so there
   is no bypass path.
@@ -145,49 +186,8 @@ the keyboard:
   immediately.
 - **Dynamic updates**: saving a limit, a validation error, and loading states are
   announced through polite/assertive live regions (`aria-live`), without ever
-  echoing secrets or raw key material.
-- **Keyboard & focus**: all controls are reachable in a logical tab order with a
-  visible focus indicator; no action depends on pointer-only interaction.
+  echoing secrets or key material.
 
 See [`docs/security-ux-guards.md`](docs/security-ux-guards.md) for the
-security/UX invariants and `tests/e2e/` for the accessibility coverage of the
-spending-limits surface.
-
-## Development
-
-```bash
-npm install
-npm run dev
-```
-
-### Git hooks (Husky)
-
-This repo uses [Husky](https://typicode.github.io/husky/) to run a
-pre-commit check. The hook is **clone-safe and CI-safe**: it is a no-op
-whenever Husky is not installed (fresh clones, CI runners, tarball
-checkouts), and only enforces locally for contributors who have run
-`pnpm install` (which triggers the `prepare` script and installs the
-hooks).
-
-* **Contributors with Husky installed:** the pre-commit hook runs
-  automatically on `git commit`; fix any reported issues before
-  committing.
-* **Fresh clones / CI:** if Husky is absent, the hook exits successfully
-  instead of failing the commit or the pipeline. No install step is
-  required for CI to stay green.
-
-If you ever need to bypass the hook for a single commit, use
-`git commit --no-verify` (use sparingly).
-
-### Environment variables
-
-All variables are optional in local development — sensible mock/default
-behavior kicks in when they're unset (see `src/lib/env.ts` for the
-validation schema). Copy `.env.example` to `.env.local` and fill in real
-values for testnet/mainnet-connected work.
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `NEXT_PUBLIC_API_URL` | No | _(none)_ | Base URL for the Mux backend API used by client-side requests, e.g. `https://api.muxprotocol.com` for mainnet or a testnet-specific URL. When unset, API routes such as `/api/auth/login` and `/api/wallets` fall back to an in-repo mock so `pnpm run dev` and CI work without a live backend — but only when `NODE_ENV` is not `production` (see the production note below). **Set this in new deploys; use the aliases below only for backward compatibility.** An alias set to an empty string (e.g. `NEX
-
-/* … truncated 1540 chars — edit only what you need near the top … */
+security/UX invariants and `tests/e2e/` for the end-to-end coverage of the
+spending-limits flow.
