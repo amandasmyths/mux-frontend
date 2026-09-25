@@ -203,3 +203,4 @@ required.
 - [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
 - [`tests/e2e/`](tests/e2e/)
 
+/* … truncated 72 chars — edit only what you need near the top … */

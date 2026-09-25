@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { randomUUID } from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
+import { randomUUID } from 'crypto';
 import { z } from 'zod';
 
 /**
@@ -110,6 +111,28 @@ export interface WalletSettingsRecord extends WalletSettingsUpdate {
   walletId: string;
   updatedAt: string;
   updatedBy: string;
+}
+
+interface AuthContext {
+  subject: string;
+  role: WalletRole;
+  walletId: string;
+}
+
+interface RestoreRecord {
+  walletId: string;
+  restoreId: string;
+  ownerId: string;
+  delegateIds: string[];
+  guardianIds: string[];
+  confirmationToken: string;
+  status: 'pending' | 'confirmed';
+  confirmedAt?: string;
+}
+
+/**
+ * Backing store abstraction. In production this is wired to the DB/RPC layer.
+ * Kept injectable so tests can exercise authz, idempotency and fail-closed pat
 }
 
 interface AuthContext {
@@ -359,25 +382,6 @@ export async function GET(
     return fail(401, ERROR_CODES.UNAUTHENTICATED, 'Authentication required.', cid);
   }
 
-  if (!isAutho
-}
-
-export async function GET(
-  req: NextRequest,
-  { params }: { params: { id: string } },
-): Promise<NextResponse> {
-  const cid = correlationId(req);
-  const walletId = params?.id ?? '';
-
-  if (!WALLET_ID_RE.test(walletId)) {
-    return fail(400, ERROR_CODES.INVALID_WALLET_ID, 'Invalid wallet id.', cid);
-  }
-
-  const principal = await resolvePrincipal(req);
-  if (!principal) {
-    return fail(401, ERROR_CODES.UNAUTHENTICATED, 'Authentication required.', cid);
-  }
-
   if (!isAuthorized(principal, walletId)) {
     return fail(403, ERROR_CODES.FORBIDDEN, 'Not authorized for this wallet.', cid);
   }
@@ -463,13 +467,205 @@ export async function GET(
   );
 }
 
+interface AuthContext {
+  subject: string;
+
+  );
+}
+
+/**
+ * Resolve the caller identity from headers. Deny-by-default: absence of a
+ * recognized credential yields no auth context.
+ */
+function resolveAuth(req: NextRequest, walletId: string): AuthContext | null {
+  const role = req.headers.get('x-mux-role') as ArchiveRestoreRole | null;
+  const subject = req.headers.get('x-mux-subject');
+  if (!role || !subject) return null;
+  if (!['owner', 'delegate', 'guardian', 'api-key', 'jwt'].includes(role)) return null;
+  return { subject, role, walletId };
+}
+
+function isAuthorized(auth: AuthContext, record: RestoreRecord): boolean {
+  switch (auth.role) {
+    case 'owner':
+      return auth.subject === record.ownerId;
+    case 'delegate':
+      return record.delegateIds.includes(auth.subject);
+    case 'guardian':
+      return record.guardianIds.includes(auth.subject);
+    case 'api-key':
+    case 'jwt':
+      // Service credentials must still map to an owner/delegate/guardian subject.
+      return (
+        auth.subject === record.ownerId ||
+        record.delegateIds.includes(auth.subject) ||
+        record.guardianIds.includes(auth.subject)
+      );
+    default:
+      return false;
+  }
+}
+
+function parseBody(raw: unknown): ArchiveRestoreConfirmationRequest | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const body = raw as Record<string, unknown>;
+  const restoreId = body.restoreId;
+  const confirmationToken = body.confirmationToken;
+  const idempotencyKey = body.idempotencyKey;
+  if (typeof restoreId !== 'string' || restoreId.length === 0 || restoreId.length > 128) {
+    return null;
+  }
+  if (
+    typeof confirmationToken !== 'string' ||
+    confirmationToken.length === 0 ||
+    confirmationToken.length > 512
+  ) {
+    return null;
+  }
+  if (idempotencyKey !== undefined && typeof idempotencyKey !== 'string') return null;
+  return { restoreId, confirmationToken, idempotencyKey };
+}
+
+/**
+ * POST /api/wallets/[id]/restore-confirmations
+ *
+ * Confirms an archive restore for the given wallet. Idempotent on restoreId.
+ */
+export async function POST(
+  req: NextRequest,
+  ctx: { params: { id: string } },
+): Promise<NextResponse<ArchiveRestoreConfirmationResult | ArchiveRestoreErrorBody>> {
+  const correlationId = req.headers.get('x-correlation-id') ?? randomUUID();
+  const walletId = ctx?.params?.id;
+
+  if (!walletId || typeof walletId !== 'string') {
+    return errorResponse(
+      ArchiveRestoreErrorCode.INVALID_REQUEST,
+      'wallet id is required',
+      correlationId,
+      400,
+    );
+  }
+
+  const auth = resolveAuth(req, walletId);
+  if (!auth) {
+    return errorResponse(
+      ArchiveRestoreErrorCode.UNAUTHORIZED,
+      'missing or invalid credentials',
+      correlationId,
+      401,
+    );
+  }
+
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch {
+    return errorResponse(
+      ArchiveRestoreErrorCode.INVALID_REQUEST,
+      'malformed JSON body',
+      correlationId,
+      400,
+    );
+  }
+
+  const body = parseBody(raw);
+  if (!body) {
+    return errorResponse(
+      ArchiveRestoreErrorCode.INVALID_REQUEST,
+      'invalid restore confirmation payload',
+      correlationId,
+      400,
+    );
+  }
+
+  try {
+    const activeStore = getStore();
+    const record = await activeStore.getRestore(walletId, body.restoreId);
+
+    if (!record) {
+      return errorResponse(
+        ArchiveRestoreErrorCode.NOT_FOUND,
+        'restore not found',
+        correlationId,
+        404,
+      );
+    }
+
+    if (!isAuthorized(auth, record)) {
+      return errorResponse(
+        ArchiveRestoreErrorCode.FORBIDDEN,
+        'caller is not authorized to confirm this restore',
+        correlationId,
+        403,
+      );
+    }
+
+    if (record.confirmationToken !== body.confirmationToken) {
+      return errorResponse(
+        ArchiveRestoreErrorCode.FORBIDDEN,
+        'confirmation token mismatch',
+        correlationId,
+        403,
+      );
+    }
+
+    // Idempotency: replays of an already-confirmed restore return the original
+    // result without re-applying state.
+    if (record.status === 'confirmed') {
+      return NextResponse.json(
+        {
+          walletId,
+          restoreId: record.restoreId,
+          status: 'already_confirmed',
+          confirmedAt: record.confirmedAt ?? new Date().toISOString(),
+          correlationId,
+        },
+        { status: 200 },
+      );
+    }
+
+    const confirmedAt = new Date().toISOString();
+    const updated = await activeStore.confirmRestore(walletId, body.restoreId, confirmedAt);
+
+    return NextResponse.json(
+      {
+        walletId,
+        restoreId: updated.restoreId,
+        status: 'confirmed',
+        confirmedAt: updated.confirmedAt ?? confirmedAt,
+        correlationId,
+      },
+      { status: 200 },
+    );
+  } catch (err) {
+    if (err instanceof DependencyUnavailableError) {
+      // Fail-closed on dependency outage for writes.
+      return errorResponse(
+        ArchiveRestoreErrorCode.DEPENDENCY_UNAVAILABLE,
+        'archive restore backend unavailable',
+        correlationId,
+        503,
+        true,
+      );
+    }
+    return errorResponse(
+      ArchiveRestoreErrorCode.INTERNAL,
+      'unexpected error confirming restore',
+      correlationId,
+      500,
+      true,
+    );
+  }
+}
+
 /**
  * Onboarding: first key + wallet.
  *
  * Deny-by-default authz (owner only for provisioning), idempotent on the
  * `Idempotency-Key` header, and fail-closed on dependency outage.
  */
-export async function POST(
+export async function POST_ONBOARD(
   req: NextRequest,
   { params }: { params: { id: string } },
 ) {
@@ -655,4 +851,3 @@ async function onboardFirstKey(
   throw new Error('wallet service not configured');
 }
 
-}
