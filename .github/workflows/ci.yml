@@ -19,6 +19,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Required gate: PRs cannot merge with TypeScript errors. This job is the
+  # single source of truth for type safety and must be configured as a
+  # required status check on the main/staging branch protection rules.
   typecheck:
     name: Typecheck
     runs-on: ubuntu-latest

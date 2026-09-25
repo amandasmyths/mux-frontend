@@ -34,6 +34,36 @@ and how to verify it.
   package, keeping the versions that were actually in effect. Also added
   `"engines": { "node": ">=22" }` to match the Node version CI installs.
 
+## Required status check (branch protection)
+
+The `typecheck` job is a **required gate**: it must be configured as a
+required status check on the default branch so a PR cannot merge while it
+is failing, pending, or missing. This is what makes the gate fail-closed —
+a red or absent typecheck blocks the merge instead of merely warning.
+
+Configure it once in the repository settings:
+
+1. **Settings → Branches → Branch protection rules** for the default
+   branch (or the relevant ruleset).
+2. Enable **Require status checks to pass before merging**.
+3. Add the check named **`typecheck`** (the job id in
+   `.github/workflows/ci.yml`) to the required list.
+4. Keep **Require branches to be up to date before merging** enabled so
+   the gate re-runs against the latest base.
+
+Notes for maintainers:
+
+- The required check name must match the CI job id exactly (`typecheck`).
+  Renaming the job in the workflow silently drops the gate, so update the
+  branch protection rule in the same PR if the job is ever renamed.
+- Because `build` already `needs: [typecheck, unit-tests]`, a failing
+  typecheck also prevents the build matrix from starting — the gate fails
+  fast and cheaply.
+- If the workflow is ever made conditional (e.g. path filters), keep the
+  `typecheck` job unconditional so the required check always reports a
+  status; a skipped required check leaves PRs stuck in "Expected" and
+  blocks merges.
+
 ## Known follow-up (not done here)
 
 Issue #1 in this batch of changes added `@playwright/test` as a new
@@ -54,3 +84,5 @@ one-time fix; typecheck/test/build all pass once the lockfile is synced.
       set to a testnet URL, and set to a mainnet URL.
 - [ ] The `typecheck` CI job fails (as expected) if a type error is
       introduced, before the `build` matrix jobs start.
+- [ ] Branch protection on the default branch lists `typecheck` as a
+      required status check, so a PR with type errors cannot merge.
