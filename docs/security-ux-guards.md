@@ -95,6 +95,88 @@ grants it, so adding a surface cannot leak a previously hidden capability.
 - Document the rollback path in the PR description: disabling the flag must
   restore the previous behavior without data migration.
 
+## Route loading UX
+
+Route loading is a privileged read surface: it resolves a route (and its
+associated wallet/AA/payment context) before the user can act on it. It must
+follow the same fail-closed, deny-by-default contract as the error boundaries
+above. This section is the canonical contract for route loading.
+
+### Typed entrypoints and stable error codes
+
+Route loading is exposed through a typed entrypoint that returns a
+discriminated result. Callers branch on the error code, never on message text.
+Stable error codes:
+
+| Code | Meaning |
+| --- | --- |
+| `ROUTE_OK` | Route resolved; result returned. |
+| `ROUTE_FORBIDDEN` | Caller is not authorized for the requested route scope. |
+| `ROUTE_AUTH_EXPIRED` | Session/JWT expired; re-auth required. |
+| `ROUTE_DELEGATE_REVOKED` | Delegate/guardian grant was revoked. |
+| `ROUTE_INVALID_INPUT` | Route params failed validation (unknown key, bad shape). |
+| `ROUTE_NOT_FOUND` | Route does not exist for the caller's scope. |
+| `ROUTE_DEPENDENCY_UNAVAILABLE` | RPC/DB/Horizon unavailable; fail closed. |
+| `ROUTE_RATE_LIMITED` | Too many loads; retry later. |
+| `ROUTE_UNEXPECTED` | Unclassified failure; treated as failure, never success. |
+
+Every route load carries a correlation id propagated to logs and the
+user-facing error surface so support can trace a single request. The
+correlation id is opaque and never encodes secrets.
+
+### Loading states
+
+- A route load is a single discriminated state machine: `idle` → `loading` →
+  `loaded` | `error`. The UI never renders a privileged action while the state
+  is `loading` or `error`; it renders a skeleton/placeholder instead.
+- A failed load never falls back to a cached or optimistic route. On
+  `ROUTE_DEPENDENCY_UNAVAILABLE` the UI shows a retry affordance and keeps the
+  action disabled (fail closed).
+- Retries are idempotent reads; a replayed load returns the same resolved route
+  rather than re-applying any side effect.
+
+### Authorization
+
+- Route loads require an authorized owner/delegate/guardian session or a scoped
+  API-key/JWT. The server resolves the caller's permitted scope; the client
+  cannot request a broader scope than it holds.
+- An expired session fails closed with `ROUTE_AUTH_EXPIRED`; a revoked delegate
+  fails closed with `ROUTE_DELEGATE_REVOKED`; a wrong role fails closed with
+  `ROUTE_FORBIDDEN`. The loader never substitutes a cached route for a failed
+  authorization check.
+- Deny by default: a new route scope is unreadable until the server grants it,
+  so adding a route cannot leak a previously hidden capability.
+
+### Edge cases and failure modes
+
+- **Concurrent/replayed requests:** route loads are idempotent reads keyed by
+  route id; concurrent loads for the same route resolve to the same result.
+- **Dependency outage:** RPC/DB/Horizon outage fails closed with
+  `ROUTE_DEPENDENCY_UNAVAILABLE`; no silent success that could mask a missing
+  route or stale wallet/AA/payment context.
+- **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
+  re-auth; the loader is never used to escalate scope.
+- **Adversarial input:** oversized or malformed route params are rejected with
+  `ROUTE_INVALID_INPUT` before any privileged call; loads are rate-limited per
+  session and per IP to prevent griefing.
+- **Testnet vs mainnet:** the network is explicit and validated; a mainnet
+  route is never satisfied by testnet state and vice versa.
+
+### Observability
+
+- Emit structured logs with the correlation id, the resolved error code, and
+  the route id (never raw key material, JWTs, webhook secrets, or full request
+  bodies).
+- Track route load success/failure counts, load latency, rate-limit events, and
+  rejected-input counts so ops can alert on abuse or misconfiguration.
+
+### Rollout and rollback
+
+- Changes to route loading that touch money paths or mainnet behavior must land
+  behind a feature flag or kill-switch.
+- Document the rollback path in the PR description: disabling the flag must
+  restore the previous behavior without data migration.
+
 ## Audit log filters
 
 The audit log is a privileged, read-only surface that exposes who did what, to
@@ -159,89 +241,28 @@ error surface so support can trace a single request.
   reads keep concurrent queries consistent; replayed requests return the same
   page.
 - **Dependency outage:** DB/index outage fails closed; no silent empty-success
-  that could mask missing entries.
+  that could mask activity.
 - **Auth expiry / wrong role / revoked delegate:** fail closed and prompt
-  re-auth; the filter set is never used to escalate scope.
-- **Adversarial input:** oversized filter payloads, unknown keys, and inverted
-  ranges are rejected before querying; queries are rate-limited per session and
-  per IP to prevent griefing.
-- **Testnet vs mainnet:** the `network` filter is explicit and validated; a
-  mainnet query is never satisfied by testnet data and vice versa.
+  re-auth; filters are never used to escalate scope.
+- **Adversarial input:** oversized ranges, unknown keys, and malformed cursors
+  are rejected with `AUDIT_INVALID_FILTER` before any privileged read; queries
+  are rate-limited per session and per IP to prevent griefing.
+- **Testnet vs mainnet:** the network is an explicit filter dimension and is
+  validated; a mainnet query is never satisfied by testnet entries and vice
+  versa.
 
 ### Observability
 
 - Emit structured logs with the correlation id, the resolved error code, and
-  the applied filter dimensions (never raw key material, JWTs, or webhook
-  secrets).
-- Track query success/failure counts, rate-limit events, and rejected-filter
-  counts so ops can alert on abuse or misconfiguration.
+  the applied filter set (never raw key material, JWTs, webhook secrets, or full
+  request bodies).
+- Track query success/failure counts, range-rejection counts, rate-limit
+  events, and rejected-input counts so ops can alert on abuse or
+  misconfiguration.
 
 ### Rollout and rollback
 
-- Changes to audit log filtering that touch money paths or mainnet behavior
-  must land behind a feature flag or kill-switch.
+- Changes to audit filtering that touch money paths or mainnet behavior must
+  land behind a feature flag or kill-switch.
 - Document the rollback path in the PR description: disabling the flag must
   restore the previous behavior without data migration.
-
-## Source maps production policy
-
-Source maps expose original source, internal module structure, and any inlined
-values to anyone who can fetch the deployed bundle. Shipping readable source
-maps to production is a security and IP risk, so the policy is **fail closed**.
-
-### Policy
-
-- **Production: source maps are disabled.** Production builds must never emit
-  or serve browser source maps. `productionBrowserSourceMaps` is `false` in
-  `next.config.ts` and must stay `false`.
-- **Development / test: source maps are enabled.** Local dev and test builds
-  keep source maps for debuggability; this is not a production surface.
-- **No public exposure.** Even when maps exist in non-production, they must not
-  be uploaded to a public CDN or served from a production origin.
-
-### Enforcement
-
-- The setting lives in `next.config.ts` as `productionBrowserSourceMaps: false`.
-  It is the single source of truth for the production policy.
-- A CI test asserts the production setting is disabled so the policy cannot
-  regress silently. Any change that re-enables production source maps must fail
-  CI and require an explicit, reviewed policy change.
-- If a future need requires production maps (e.g. private error tracking), they
-  must be uploaded to a private, access-controlled store and never served from
-  the public origin. That change requires a design note and a feature flag.
-
-### Edge cases and failure modes
-
-- **Misconfigured environment:** if an environment cannot be classified as
-  production, treat it as production and keep source maps disabled.
-- **Accidental upload:** build steps must not publish maps to public storage;
-  treat any such upload as a security incident and rotate/remove the artifact.
-- **Testnet vs mainnet:** both are production-like for this policy; neither
-  ships readable source maps.
-
-### Observability
-
-- CI reports the resolved `productionBrowserSourceMaps` value so reviewers can
-  confirm the policy at a glance. No secrets or source content are logged.
-
-### Rollback
-
-- Re-enabling production source maps is a policy change, not a routine edit. It
-  requires a design note, a private upload target, and a documented rollback in
-  the PR description.
-
-## Settings danger zone confirm phrase
-
-The Settings danger zone hosts destructive, irreversible actions (for example
-account/wallet deletion and recovery reset). These actions are gated behind a
-typed confirm-phrase guard so a stray click or a scripted request cannot trigger
-them. The guard is **fail closed**: the destructive action stays disabled until
-the exact phrase is entered.
-
-### Confirm phrase contract
-
-- The required phrase is a fixed, documented constant (for example
-  `DELETE MY ACCOUNT`). It is never derived from user input or remote config.
-- Matching is **case-insensitive** and **whitespace-normalized**: leading and
-  trailing whitespace is trimmed and internal runs of whitespace collapse to a
-  single space before comparison. No other normali

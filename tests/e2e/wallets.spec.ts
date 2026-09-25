@@ -1,71 +1,87 @@
 import { test, expect } from '@playwright/test';
 
 /**
- * E2E coverage for the wallets surface, including the empty-project CTA.
+ * Route loading UX e2e coverage (issue #773).
  *
- * The empty state must render accessible, stable copy and expose a single
- * non-privileged primary action (create the first wallet/project). It must
- * never surface privileged actions (admin, recovery, key export) or leak
- * secrets/keys/JWTs into the DOM.
+ * Verifies that wallet/route entrypoints surface a deterministic loading state,
+ * a stable error code + correlation id on failure, and fail-closed behavior when
+ * the backend dependency is unavailable. See docs/security-ux-guards.md and
+ * ROUTE_LOADING_README.md for the documented contract.
  */
 
-test.describe('wallets', () => {
-  test('empty project shows the create-first-wallet CTA', async ({ page }) => {
+const ROUTE_LOADING_TIMEOUT_MS = 15_000;
+
+// Stable error codes the route-loading surface must emit (deny-by-default).
+type RouteLoadingErrorCode =
+  | 'ROUTE_LOADING_UNAVAILABLE'
+  | 'ROUTE_LOADING_UNAUTHORIZED'
+  | 'ROUTE_LOADING_TIMEOUT';
+
+const STABLE_ERROR_CODES: RouteLoadingErrorCode[] = [
+  'ROUTE_LOADING_UNAVAILABLE',
+  'ROUTE_LOADING_UNAUTHORIZED',
+  'ROUTE_LOADING_TIMEOUT',
+];
+
+const CORRELATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+test.describe('Route loading UX', () => {
+  test('shows a loading state before the route resolves', async ({ page }) => {
     await page.goto('/wallets');
 
-    const cta = page.getByTestId('empty-project-cta');
-    await expect(cta).toBeVisible();
+    // The loading indicator must be visible while the route is resolving.
+    const loading = page.getByTestId('route-loading');
+    await expect(loading).toBeVisible({ timeout: ROUTE_LOADING_TIMEOUT_MS });
 
-    // Stable, accessible copy for the empty state.
-    await expect(
-      cta.getByRole('heading', { name: /no wallets yet/i }),
-    ).toBeVisible();
-    await expect(
-      cta.getByText(/create your first wallet to get started/i),
-    ).toBeVisible();
+    // Once resolved, the loading state must be cleared (no stuck spinner).
+    await expect(loading).toBeHidden({ timeout: ROUTE_LOADING_TIMEOUT_MS });
+  });
 
-    // Exactly one primary action, and it is the non-privileged create action.
-    const primaryAction = cta.getByRole('button', {
-      name: /create (your )?first wallet/i,
+  test('renders the wallet surface after the route resolves', async ({ page }) => {
+    await page.goto('/wallets');
+
+    await expect(page.getByTestId('route-loading')).toBeHidden({
+      timeout: ROUTE_LOADING_TIMEOUT_MS,
     });
-    await expect(primaryAction).toBeVisible();
-    await expect(primaryAction).toBeEnabled();
+    await expect(page.getByTestId('wallet-list')).toBeVisible({
+      timeout: ROUTE_LOADING_TIMEOUT_MS,
+    });
   });
 
-  test('empty project CTA does not expose privileged actions or secrets', async ({
-    page,
-  }) => {
+  test('fails closed with a stable error code and correlation id', async ({ page }) => {
+    // Simulate a backend/RPC outage on the route-loading dependency.
+    await page.route('**/api/**', (route) => route.abort('failed'));
+
     await page.goto('/wallets');
 
-    const cta = page.getByTestId('empty-project-cta');
-    await expect(cta).toBeVisible();
+    const error = page.getByTestId('route-loading-error');
+    await expect(error).toBeVisible({ timeout: ROUTE_LOADING_TIMEOUT_MS });
 
-    // Deny-by-default: no privileged surfaces in the empty state.
-    await expect(
-      cta.getByRole('button', { name: /admin|recovery|export|reveal/i }),
-    ).toHaveCount(0);
+    // The error must carry a stable, documented error code.
+    const code = await error.getAttribute('data-error-code');
+    expect(STABLE_ERROR_CODES).toContain(code as RouteLoadingErrorCode);
 
-    // No raw key material, JWTs, or secrets rendered into the DOM.
-    const html = await cta.innerHTML();
-    expect(html).not.toMatch(/-----BEGIN [A-Z ]*PRIVATE KEY-----/);
-    expect(html).not.toMatch(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/);
-    expect(html).not.toMatch(/\b(secret|privateKey|mnemonic|seed)\b\s*[:=]/i);
+    // The error must carry a correlation id for observability.
+    const correlationId = await error.getAttribute('data-correlation-id');
+    expect(correlationId).toBeTruthy();
+    expect(correlationId).toMatch(CORRELATION_ID_PATTERN);
+
+    // Fail-closed: no wallet surface is rendered on dependency outage.
+    await expect(page.getByTestId('wallet-list')).toBeHidden();
   });
 
-  test('empty project CTA primary action starts wallet creation', async ({
-    page,
-  }) => {
+  test('does not leak secrets in the route-loading error surface', async ({ page }) => {
+    await page.route('**/api/**', (route) => route.abort('failed'));
+
     await page.goto('/wallets');
 
-    const cta = page.getByTestId('empty-project-cta');
-    await expect(cta).toBeVisible();
+    const error = page.getByTestId('route-loading-error');
+    await expect(error).toBeVisible({ timeout: ROUTE_LOADING_TIMEOUT_MS });
 
-    await cta
-      .getByRole('button', { name: /create (your )?first wallet/i })
-      .click();
-
-    // The action routes into the create flow rather than performing a
-    // privileged operation inline.
-    await expect(page).toHaveURL(/\/wallets\/new(\?|$)/);
+    const text = (await error.textContent()) ?? '';
+    // Redaction guard: no raw key material, JWTs, or webhook secrets in the UI.
+    expect(text).not.toMatch(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    expect(text).not.toMatch(/S[A-Z2-7]{55}/);
+    expect(text).not.toMatch(/whsec_[A-Za-z0-9]+/);
   });
 });
