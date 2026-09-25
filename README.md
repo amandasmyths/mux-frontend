@@ -159,6 +159,36 @@ follow the backend selected by `NEXT_PUBLIC_API_URL`. This keeps the
 network scope in exactly one place instead of being applied inconsistently
 across the app.
 
+**Network selection persistence (invariant).** The active network is
+persisted across page reloads and sessions through a typed, validated
+storage layer (`src/lib/network/storage.ts`), keyed by
+`NETWORK_STORAGE_KEY`. Reads and writes go through `readPersistedNetwork()`
+and `writePersistedNetwork()`, which return a discriminated result with
+stable error codes (`network_storage_unavailable`,
+`network_storage_invalid`, `network_storage_write_failed`) and a
+correlation id — never a thrown exception and never a silent default.
+`NetworkContext` hydrates from this layer on mount and writes back on every
+`setNetwork`, so the selection survives reloads without the UI guessing.
+
+Persistence is **fail-closed**: an unknown, malformed, or unsupported
+persisted value is rejected and the context falls back to the documented
+default network (`testnet`) — it never silently defaults to `mainnet`. If
+storage is unavailable (e.g. disabled `localStorage`, SSR, or a quota
+error), the read returns `network_storage_unavailable` and the context uses
+the in-memory default for the session rather than failing the app; a failed
+write surfaces `network_storage_write_failed` and leaves the in-memory
+selection intact. In every case the persisted value is treated as a *hint*
+for the UI only.
+
+**Server remains the source of truth.** The persisted network is a
+client-side UI preference and cannot bypass server-side policy: every
+network-scoped request still carries the `?network=` param and is
+authorized/validated by the backend, which remains authoritative for
+spends, recovery, and admin. A tampered or stale persisted value can at
+most change which network's wallets the UI *asks* for — it can never grant
+access, move funds, or override a server decision. The storage layer is
+covered by unit tests for the valid, invalid, and unavailable paths.
+
 **Fail-closed on network misconfiguration.** The wallets query only runs
 against a known, supported network. If `NetworkContext` is missing, or the
 active network is unknown/unsupported, `useWallets` does not issue a
@@ -203,4 +233,3 @@ required.
 - [`docs/security-ux-guards.md`](docs/security-ux-guards.md)
 - [`tests/e2e/`](tests/e2e/)
 
-/* … truncated 72 chars — edit only what you need near the top … */
