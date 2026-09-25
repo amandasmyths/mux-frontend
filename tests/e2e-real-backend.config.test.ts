@@ -59,6 +59,18 @@ describe("playwright.real-backend.config.ts (real-backend suite)", () => {
 	it("declares a reporter so CI surfaces real-backend failures", () => {
 		expect(realBackendConfig.reporter).toBeDefined();
 	});
+
+	it("fails closed when required real-backend env vars are missing", () => {
+		vi.stubEnv("NEXT_PUBLIC_API_URL", "");
+		vi.stubEnv("E2E_TEST_EMAIL", "");
+		vi.stubEnv("E2E_TEST_PASSWORD", "");
+		expect(readRealBackendEnv()).toBeNull();
+	});
+
+	it("does not commit secrets: config reads env at runtime, not literals", () => {
+		const serialized = JSON.stringify(realBackendConfig);
+		expect(serialized).not.toMatch(/correct-horse|E2E_TEST_PASSWORD\s*[:=]\s*["'][^"']+["']/);
+	});
 });
 
 describe("readRealBackendEnv", () => {

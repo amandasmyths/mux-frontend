@@ -87,6 +87,39 @@ pnpm exec playwright test --config=playwright.real-backend.config.ts
 See `tests/e2e/real-backend/README.md` for the preview-frontend variant
 and the full list of what each spec covers.
 
+## Runbook: provisioning a real-backend environment
+
+For Stellar Wave contributors wiring this suite into a new environment
+(testnet/staging), follow these steps in order. Each step is fail-closed:
+if a step can't be completed, stop — do not run the suite against a
+partially-configured backend.
+
+1. **Confirm the backend target.** Verify `NEXT_PUBLIC_API_URL` points at
+   a real `mux-backend` you are authorized to test against. Never point
+   this at mainnet or a production money-path deployment without an
+   explicit readiness checklist sign-off (see `docs/security-ux-guards.md`).
+2. **Provision a low-privilege QA account.** Create a dedicated account
+   on that backend with the minimum role needed to exercise login and
+   wallet reads. Do not reuse a personal, admin, or custody-bearing
+   account. Record its email as `E2E_TEST_EMAIL`.
+3. **Store the password as a CI secret.** Put the account password in the
+   CI secret store as `E2E_TEST_PASSWORD`. Never commit it, never echo it
+   in logs, and never place it in a `NEXT_PUBLIC_*` variable.
+4. **Wire the CI job.** Export all three vars into the job that runs
+   `pnpm exec playwright test --config=playwright.real-backend.config.ts`.
+   If the secrets are not provisioned for an environment, leave them
+   unset — the suite skips with `REAL_BACKEND_SKIP_REASON` rather than
+   failing or silently passing.
+5. **Verify fail-closed behavior.** Run the config test
+   (`tests/e2e-real-backend.config.test.ts`) and confirm the negative
+   path still holds: with the required env absent, the config must not
+   produce a green run that never touched a real backend.
+6. **Rollback.** This suite is read-only against the backend (login +
+   wallet reads) and gated behind env presence, so rollback is simply
+   unsetting the three vars — the suite becomes a no-op. No backend
+   state is mutated by these specs; if a future spec adds a write path,
+   it must land behind a feature flag with its own rollback note.
+
 ## Security
 
 - Test credentials are a real (if low-privilege) account on a real
@@ -98,3 +131,6 @@ and the full list of what each spec covers.
   `NEXT_PUBLIC_*` variable or written to `localStorage`. The
   real-backend specs don't introduce any new storage path; they exercise
   the existing HttpOnly `mux_auth_token` cookie flow end-to-end.
+- The suite is deny-by-default: it only runs when explicitly provisioned
+  with real-backend env, and it never asserts mock-only credentials or
+  tokens. See `docs/security-ux-guards.md` for the broader guard model.

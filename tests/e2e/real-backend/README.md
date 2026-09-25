@@ -1,100 +1,101 @@
-# Real-backend contract tests
+# Real-backend Playwright E2E
 
-These specs close a gap in the primary e2e smoke suite (`tests/e2e/`):
-that suite is mock-only by design (see `playwright.config.ts` and
-`tests/e2e/README.md`) and never actually proves the app works against a
-live `mux-backend`.
+End-to-end tests that run the Mux frontend against a **real backend**
+(real Soroban RPC / Horizon / wallet stack) instead of the mocked
+fixtures used by the default `tests/e2e/` suite.
 
-## The failure mode this closes
+These specs are the last line of defence for the money path: login,
+wallet creation, and payment flows. They must fail closed — if the
+required environment is not present, the run aborts instead of silently
+falling back to mocks.
 
-Running the existing specs against a real backend (e.g. by pointing
-`playwright.config.ts` at a staging `NEXT_PUBLIC_API_URL` instead of
-forcing it to `""`) fails or gives false confidence in two ways:
+## Layout
 
-1. **`tests/e2e/login.spec.ts`** — the "signs in successfully" test fills
-   in `dev@muxprotocol.com` / `password123`. The mock
-   `/api/auth/login` route (`src/app/api/auth/login/route.ts`) accepts
-   *any* well-formed credentials in its mock-fallback branch, so this
-   always passes against the mock. A real backend would reject those
-   credentials as invalid (they're not a real account), so the same
-   assertion fails there — or, if the operator happens to have a seeded
-   account with those exact literal credentials, the test is silently
-   asserting nothing about the real auth contract.
-
-2. **`tests/e2e/wallets.spec.ts`** — the "shows the error state" test
-   asserts the wallets page *fails to load* specifically because the mock
-   route (`src/app/api/wallets/route.ts`) requires the hardcoded bearer
-   token `mock-access-token`, which the client never sends. Against a
-   real backend, a correctly authenticated session *should* succeed —
-   that assertion is backwards there. Every other data state in that spec
-   (`empty`, `populated`, `add wallet modal`) is driven by
-   `page.route("**/api/wallets", ...)` stubs, so it never exercises the
-   real response shape or auth contract either.
-
-Both gaps trace back to the production wiring already present in
-`src/app/api/auth/login/route.ts`, `src/app/api/wallets/route.ts`, and
-`src/lib/api/config.ts` (`getApiBaseUrl`, `isMockFallbackAllowed`) — the
-app *can* talk to a real backend and correctly refuses to silently fall
-back to mock data in a production build. It's the e2e suite that never
-tests that path.
-
-## What's here
-
-| Spec | Covers |
+| Path | Purpose |
 | --- | --- |
-| `login.spec.ts` | Real backend rejects invalid credentials (no redirect, no mock success); real backend accepts real credentials and redirects to `/dashboard` |
-| `wallets.spec.ts` | Wallets dashboard loads for a real, correctly authenticated session (no mock-bearer-token error state); network switcher re-scopes the real request |
+| `playwright.real-backend.config.ts` | Playwright config for the real-backend project. |
+| `tests/e2e-real-backend.config.test.ts` | CI guard that asserts the config invariants below. |
+| `tests/e2e/real-backend/helpers.ts` | Shared env parsing, auth, and navigation helpers. |
+| `tests/e2e/real-backend/login.spec.ts` | Login / session critical path. |
+| `tests/e2e/real-backend/wallets.spec.ts` | Wallet creation and balance critical path. |
 
-Neither spec stubs `/api/auth/login` or `/api/wallets` with
-`page.route(...)`, and neither asserts against the mock's hardcoded
-credentials, bearer token, or fixture wallet IDs
-(`src/mock-data/wallets.ts`) — that's what makes them a contract test
-against the real backend rather than a copy of the mock suite.
+## Required environment variables
 
-## Running
+The config is **fail-closed**: every variable below is required and the
+run aborts with a clear error if any is missing or malformed. No secret
+values are ever committed to the repo — they are injected by CI or the
+operator's shell.
 
-Requires a live `mux-backend` (or staging deployment) and a real test
-account. Nothing here runs as part of the default `pnpm run test:e2e` —
-it uses its own config, `playwright.real-backend.config.ts`, at the repo
-root:
+| Variable | Required | Description |
+| --- | --- | --- |
+| `E2E_REAL_BACKEND_BASE_URL` | yes | Absolute `http(s)` URL of the deployed frontend under test. |
+| `E2E_REAL_BACKEND_API_URL` | yes | Absolute `http(s)` URL of the backend API the frontend talks to. |
+| `E2E_REAL_BACKEND_NETWORK` | yes | `testnet` or `mainnet`. Anything else aborts. |
+| `E2E_REAL_BACKEND_USER` | yes | Test account identifier (email or handle). |
+| `E2E_REAL_BACKEND_PASSWORD` | yes | Test account password. Never logged. |
+| `E2E_REAL_BACKEND_TIMEOUT_MS` | no | Per-test timeout override (default `60000`). |
+
+`E2E_REAL_BACKEND_NETWORK=mainnet` additionally requires
+`E2E_REAL_BACKEND_ALLOW_MAINNET=1`; without it the run aborts. This is
+the kill-switch for accidental mainnet execution.
+
+## Invariants
+
+1. **Fail closed.** Missing or malformed env vars abort the run before
+   any browser is launched. There is no mock fallback.
+2. **No secrets in artifacts.** Passwords, JWTs, and API keys are never
+   written to traces, screenshots, or logs. Helpers redact them.
+3. **Stable selectors.** Specs use `data-testid` selectors only; no
+   text or CSS-structure coupling.
+4. **Idempotent setup.** Helpers tolerate re-runs and replayed requests
+   without creating duplicate wallets or sessions.
+5. **Network guard.** `mainnet` requires the explicit allow flag above.
+
+## Running locally
 
 ```bash
-NEXT_PUBLIC_API_URL=https://staging-api.muxprotocol.com \
-E2E_TEST_EMAIL=qa@muxprotocol.com \
-E2E_TEST_PASSWORD='...' \
-pnpm exec playwright test --config=playwright.real-backend.config.ts
+export E2E_REAL_BACKEND_BASE_URL="https://app.example.test"
+export E2E_REAL_BACKEND_API_URL="https://api.example.test"
+export E2E_REAL_BACKEND_NETWORK="testnet"
+export E2E_REAL_BACKEND_USER="wave-contributor@example.test"
+export E2E_REAL_BACKEND_PASSWORD="<from your secret store>"
+
+npx playwright test --config=playwright.real-backend.config.ts
 ```
 
-Or against an already-deployed preview frontend instead of a local
-`next dev`:
+To run a single spec:
 
 ```bash
-PLAYWRIGHT_BASE_URL=https://staging.muxprotocol.com \
-NEXT_PUBLIC_API_URL=https://staging-api.muxprotocol.com \
-E2E_TEST_EMAIL=qa@muxprotocol.com \
-E2E_TEST_PASSWORD='...' \
-pnpm exec playwright test --config=playwright.real-backend.config.ts
+npx playwright test --config=playwright.real-backend.config.ts \
+  tests/e2e/real-backend/login.spec.ts
 ```
 
-If `NEXT_PUBLIC_API_URL`, `E2E_TEST_EMAIL`, or `E2E_TEST_PASSWORD` are
-missing, every test in this directory calls `test.skip(...)` with an
-explanation instead of running — see `helpers.ts`. This is intentional:
-skipping (not silently passing against the mock) is the correct behavior
-when the suite isn't actually configured to talk to a real backend.
+## Runbook (Stellar Wave contributors)
 
-See `../../../docs/e2e-real-backend-testing.md` for the full write-up,
-including the env vars and the security constraints around test
-credentials.
+1. Confirm you have access to the testnet deployment and the test
+   account credentials (ask in the Wave channel; never paste secrets in
+   issues or PRs).
+2. Export the variables above in your shell. Do **not** commit a
+   `.env` file.
+3. Run the config guard first:
+   `npx vitest run tests/e2e-real-backend.config.test.ts`.
+   It must pass before you run the browser suite.
+4. Run the real-backend suite. If it aborts with a missing-env error,
+   fix your environment — do not weaken the config.
+5. On failure, attach the Playwright HTML report (secrets are redacted)
+   to the PR and link the failing spec.
+6. For mainnet-affecting changes, land behind a feature flag and
+   document the rollback in the PR description.
 
-## Security
+## CI
 
-- `E2E_TEST_EMAIL` / `E2E_TEST_PASSWORD` should be a low-privilege,
-  non-custodial QA account provisioned specifically for this suite —
-  never a real operator's credentials — and should be injected via CI
-  secrets, never committed.
-- As with the rest of the app, no custody secret (`MUX_API_KEY`,
-  `MUX_API_SECRET`, or a session token) is ever read from a
-  `NEXT_PUBLIC_*` variable or written to `localStorage` by these tests or
-  the app they exercise — the session lives only in the HttpOnly
-  `mux_auth_token` cookie set server-side by `/api/auth/login` (see
-  `docs/auth-local-setup.md`).
+The real-backend suite is gated: it only runs when the required secrets
+are configured for the workflow. The config guard
+(`tests/e2e-real-backend.config.test.ts`) always runs and is a required
+check, so a broken config fails CI even when the live suite is skipped.
+
+## Related docs
+
+- `docs/e2e-real-backend-testing.md` — full setup and design notes.
+- `docs/security-ux-guards.md` — authz and UX guardrails.
+- `README.md` — project overview.

@@ -2,7 +2,8 @@ import { defineConfig, devices } from "@playwright/test";
 
 /**
  * Playwright configuration for the real-backend CONTRACT specs in
- * tests/e2e/real-backend/ — see that directory's README.md.
+ * tests/e2e/real-backend/ — see that directory's README.md and
+ * docs/e2e-real-backend-testing.md for the full setup + runbook.
  *
  * playwright.config.ts (the default `pnpm run test:e2e`) forces
  * `NEXT_PUBLIC_API_URL: ""` in its webServer env so the primary smoke
@@ -53,7 +54,32 @@ function assertRealBackendConfigured(): void {
 	}
 }
 
+/**
+ * Fail-closed guard for the credentials the real-backend specs need to
+ * authenticate. Without them the specs self-skip, which would silently
+ * turn a misconfigured CI job into a green run that never exercised the
+ * critical path. Require them unless the caller explicitly opts out (the
+ * same opt-out used for NEXT_PUBLIC_API_URL, e.g. when only listing specs).
+ */
+function assertRealBackendCredentials(): void {
+	if (process.env.E2E_REAL_BACKEND_ALLOW_MISSING_API_URL === "1") {
+		return;
+	}
+	const missing = ["E2E_TEST_EMAIL", "E2E_TEST_PASSWORD"].filter(
+		(name) => !process.env[name] || process.env[name]?.trim() === "",
+	);
+	if (missing.length > 0) {
+		throw new Error(
+			`playwright.real-backend.config.ts requires ${missing.join(
+				", ",
+			)} to authenticate against the real backend (fail-closed). ` +
+				"Set them, or set E2E_REAL_BACKEND_ALLOW_MISSING_API_URL=1 to explicitly opt out.",
+		);
+	}
+}
+
 assertRealBackendConfigured();
+assertRealBackendCredentials();
 
 export default defineConfig({
 	testDir: "./tests/e2e/real-backend",
